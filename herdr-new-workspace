@@ -13,6 +13,9 @@ export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$PATH"
 
 SELF=${0:A}
 HERDR=${HERDR_BIN_PATH:-herdr}
+# A long-running server keeps reporting its original binary path, which goes
+# stale when herdr is reinstalled or moved.
+[[ -x $HERDR ]] || HERDR=herdr
 PLUGIN_ID=bethanyj28.new-workspace
 PINNED=${HERDR_PROJECTS_FILE:-${HERDR_PLUGIN_CONFIG_DIR:-$HOME/.config/herdr}/projects}
 STATE_DIR=${HERDR_PLUGIN_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/herdr}
