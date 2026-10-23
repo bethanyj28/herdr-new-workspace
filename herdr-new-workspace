@@ -1,0 +1,234 @@
+#!/bin/zsh
+# herdr-new-workspace — popup for choosing a directory before creating a herdr
+# workspace.
+#
+# Bind it in ~/.config/herdr/config.toml:
+#   [[keys.command]]
+#   key = "prefix+shift+n"
+#   type = "popup"
+#   command = "/path/to/herdr-new-workspace"
+#
+# Project list: ★ pinned (~/.config/herdr/projects), ● open panes, ◷ history.
+# Typing a query that starts with ~ / ./ or ../ browses the filesystem instead.
+# Then pick an agent to start in the new workspace (last choice preselected).
+
+emulate -R zsh
+setopt pipe_fail extended_glob
+export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$PATH"
+
+SELF=${0:A}
+PINNED=${HERDR_PROJECTS_FILE:-$HOME/.config/herdr/projects}
+HISTORY=${XDG_STATE_HOME:-$HOME/.local/state}/herdr/new-workspace-history
+HISTORY_MAX=50
+AGENT_STATE=${HISTORY:h}/new-workspace-agent
+AGENTS=(claude copilot codex gemini opencode amp cursor-agent)
+TAB=$'\t'
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+
+abbrev() { print -r -- "${1/#$HOME/~}" }
+
+expand_path() {
+  local p=$1
+  [[ $p == \~ || $p == \~/* ]] && p=$HOME${p:1}
+  [[ $p != / ]] && p=${p%/}
+  print -r -- "$p"
+}
+
+trim() { local s=${1%%\#*}; s=${s##[[:space:]]#}; print -r -- "${s%%[[:space:]]#}" }
+
+branch_of() { [[ -e $1/.git ]] && git -C "$1" symbolic-ref --short -q HEAD 2>/dev/null }
+
+is_path_query() { [[ $1 == \~* || $1 == /* || $1 == . || $1 == .. || $1 == ./* || $1 == ../* ]] }
+
+ensure_pinned_file() {
+  [[ -e $PINNED ]] && return
+  mkdir -p "${PINNED:h}"
+  print -r -- "# Projects pinned in the herdr new-workspace popup, one directory per line." > "$PINNED"
+}
+
+# ── candidate lists (fields: full path, tag, display path, branch) ───────────
+
+build_candidates() {
+  local -A seen
+  local tag p line
+  {
+    if [[ -r $PINNED ]]; then
+      while IFS= read -r line; do
+        line=$(trim "$line")
+        [[ -n $line ]] && print -r -- "★$TAB$(expand_path "$line")"
+      done < "$PINNED"
+    fi
+    herdr pane list 2>/dev/null | jq -r '.result.panes[]?.cwd // empty' 2>/dev/null |
+      while IFS= read -r p; do print -r -- "●$TAB$p"; done
+    if [[ -r $HISTORY ]]; then
+      while IFS= read -r p; do print -r -- "◷$TAB$p"; done < "$HISTORY"
+    fi
+  } | while IFS=$TAB read -r tag p; do
+    p=$(expand_path "$p")
+    [[ -d $p && -z ${seen[$p]-} ]] || continue
+    seen[$p]=1
+    print -r -- "$p$TAB$tag$TAB$(abbrev "$p")$TAB$(branch_of "$p")"
+  done
+}
+
+# Directory browsing: prefix-matches the last path segment, case-insensitively.
+path_candidates() {
+  local q=$1 dirpart base full d
+  if [[ $q == \~ || $q == . || $q == .. ]]; then
+    dirpart=$q/ base=
+  elif [[ $q == */* ]]; then
+    dirpart=${q%/*}/ base=${q##*/}
+  fi
+  full=$(expand_path "$dirpart")
+  [[ $full == /* ]] || full=$PWD/$full
+  [[ -d $full ]] || return 0
+  [[ $full == */ ]] || full=$full/
+  [[ -z $base ]] && print -r -- "${full:A}$TAB$TAB$dirpart$TAB$(branch_of "$full")"
+  for d in $full(#i)${(b)base}*(N/); do
+    print -r -- "${d:A}$TAB$TAB$dirpart${d:t}/$TAB"
+  done
+}
+
+candidates() {
+  if is_path_query "$1"; then path_candidates "$1"; else cat "$HNW_CACHE"; fi
+}
+
+# fzf searches the project list itself; in path mode the generator filters.
+on_change() {
+  local reload="reload(${(q)SELF} --candidates {q})"
+  if is_path_query "$1"; then print -r -- "disable-search+$reload"; else print -r -- "enable-search+$reload"; fi
+}
+
+preview() {
+  local d=$1
+  [[ -d $d ]] || { print "(directory does not exist yet)"; return }
+  printf '\e[1m%s\e[0m\n\n' "$(abbrev "$d")"
+  if git -C "$d" rev-parse --is-inside-work-tree &>/dev/null; then
+    git -C "$d" -c color.status=always status -sb 2>/dev/null | head -12
+    printf '\n\e[2m%s\e[0m\n\n' "$(git -C "$d" log -1 --format='%h %s (%cr)' 2>/dev/null)"
+  fi
+  ls -A "$d" 2>/dev/null | head -40
+}
+
+toggle_pin() {
+  local target=$1 line found=
+  local -a keep
+  ensure_pinned_file
+  while IFS= read -r line; do
+    local p=$(trim "$line")
+    if [[ -n $p && $(expand_path "$p") == $target ]]; then found=1; else keep+=("$line"); fi
+  done < "$PINNED"
+  if [[ -n $found ]]; then
+    print -rl -- "${keep[@]}" > "$PINNED"
+  else
+    print -r -- "$(abbrev "$target")" >> "$PINNED"
+  fi
+}
+
+record_history() {
+  local -a h
+  [[ -r $HISTORY ]] && h=("${(@f)$(<"$HISTORY")}")
+  h=("$1" "${(@)h:#$1}")
+  mkdir -p "${HISTORY:h}"
+  print -rl -- "${(@)h[1,HISTORY_MAX]}" > "$HISTORY"
+}
+
+# ── interactive steps ────────────────────────────────────────────────────────
+
+FZF_FORM=(--layout=reverse --height=100% --info=inline-right)
+
+# Prints the chosen directory (which may not exist yet).
+pick_dir() {
+  local out rc
+  local refresh="reload(${(q)SELF} --refresh {q})"
+  out=$(fzf "${FZF_FORM[@]}" < "$HNW_CACHE" \
+    --delimiter=$TAB --with-nth='{2} {3}  {4}' --accept-nth=1 --print-query \
+    --tiebreak=index --prompt='project> ' \
+    --header=$'enter select · tab browse into · ctrl-p pin/unpin · ctrl-e edit pins\ntype ~/ or / to open any directory' \
+    --preview="${(q)SELF} --preview {1}" --preview-window='right,45%,border-left' \
+    --bind="change:transform:${(q)SELF} --on-change {q}" \
+    --bind="tab:transform-query(q={3}; printf '%s/' \"\${q%/}\")" \
+    --bind="ctrl-p:execute-silent(${(q)SELF} --toggle-pin {1})+$refresh" \
+    --bind="ctrl-e:execute(${(q)SELF} --ensure-pinned; ${EDITOR:-vi} ${(q)PINNED})+$refresh")
+  rc=$?
+  (( rc == 0 || rc == 1 )) || return 1
+  local -a lines=("${(@f)out}")
+  if [[ -n ${lines[2]-} ]]; then
+    print -r -- "${lines[2]}"
+  elif [[ -n ${lines[1]-} ]]; then
+    local p=$(expand_path "${lines[1]}")
+    [[ $p == /* ]] || p=$PWD/$p
+    print -r -- "${p:a}"
+  else
+    return 1
+  fi
+}
+
+# Prints the agent command to start, or nothing for a plain shell.
+pick_agent() {
+  local a choice last=
+  [[ -r $AGENT_STATE ]] && last=$(<"$AGENT_STATE")
+  local -a keys=()
+  for a in $AGENTS; do (( $+commands[$a] )) && keys+=$a; done
+  (( $#keys )) || return 0
+  keys+=none
+  (( ${keys[(Ie)$last]} )) && keys=("$last" "${(@)keys:#$last}")
+  choice=$(for a in $keys; do
+      [[ $a == none ]] && print -r -- "none${TAB}none (just a shell)" || print -r -- "$a$TAB$a"
+    done | fzf "${FZF_FORM[@]}" --no-sort --delimiter=$TAB --with-nth=2 --accept-nth=1 \
+      --prompt='agent> ' --header="start in $(abbrev "$1")") || return 1
+  mkdir -p "${AGENT_STATE:h}"
+  print -r -- "$choice" > "$AGENT_STATE"
+  [[ $choice == none ]] || print -r -- "$choice"
+}
+
+ask() {  # ask <var> <prompt>  — editable prefilled input
+  vared -p "%B$2%b " "$1"
+}
+
+main() {
+  export HNW_CACHE=$(mktemp -t herdr-new-workspace)
+  trap 'rm -f "$HNW_CACHE"' EXIT
+  trap 'exit 130' INT
+  build_candidates > "$HNW_CACHE"
+
+  local dir
+  dir=$(pick_dir) || exit 0
+  if [[ ! -d $dir ]]; then
+    read -q "?Create $(abbrev "$dir")? [y/N] " || exit 0
+    print; mkdir -p "$dir" || { read -sk1 '?press any key'; exit 1 }
+  fi
+
+  local agent
+  agent=$(pick_agent "$dir") || exit 0
+
+  local label=${dir:t}
+  ask label 'label:' || exit 0
+  local -a cmd=(workspace create --cwd "$dir" --focus)
+  [[ -n $label ]] && cmd+=(--label "$label")
+
+  local out
+  if out=$(herdr "${cmd[@]}" 2>&1); then
+    record_history "$dir"
+    if [[ -n $agent ]]; then
+      local pane=$(print -r -- "$out" | jq -r '.result.root_pane.pane_id // empty')
+      [[ -n $pane ]] && herdr pane run "$pane" "$agent" >/dev/null
+    fi
+  else
+    print -r -- "herdr workspace create failed:"
+    print -r -- "$out"
+    read -sk1 '?press any key to close'
+    exit 1
+  fi
+}
+
+case ${1-} in
+  --candidates) candidates "${2-}" ;;
+  --on-change) on_change "${2-}" ;;
+  --refresh) build_candidates > "$HNW_CACHE"; candidates "${2-}" ;;
+  --preview) preview "${2-}" ;;
+  --toggle-pin) toggle_pin "${2-}" ;;
+  --ensure-pinned) ensure_pinned_file ;;
+  *) main ;;
+esac
