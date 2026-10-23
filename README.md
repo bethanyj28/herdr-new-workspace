@@ -39,7 +39,7 @@ new_workspace = "prefix+alt+n"  # move the built-in out of the way
 key = "prefix+shift+n"
 type = "plugin_action"
 command = "bethanyj28.new-workspace.open"
-description = "new workspace"
+description = "new workspace (picker)"
 ```
 
 Pinned projects live in `projects` in the plugin's config directory
