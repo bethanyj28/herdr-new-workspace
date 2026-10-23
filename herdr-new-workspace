@@ -1,14 +1,9 @@
 #!/bin/zsh
 # herdr-new-workspace — popup for choosing a directory before creating a herdr
-# workspace.
+# workspace. Runs as a herdr plugin (see herdr-plugin.toml) or as a plain
+# `type = "popup"` custom command.
 #
-# Bind it in ~/.config/herdr/config.toml:
-#   [[keys.command]]
-#   key = "prefix+shift+n"
-#   type = "popup"
-#   command = "/path/to/herdr-new-workspace"
-#
-# Project list: ★ pinned (~/.config/herdr/projects), ● open panes, ◷ history.
+# Project list: ★ pinned (<config dir>/projects), ● open panes, ◷ history.
 # Typing a query that starts with ~ / ./ or ../ browses the filesystem instead.
 # Then pick an agent to start in the new workspace (last choice preselected).
 
@@ -17,10 +12,13 @@ setopt pipe_fail extended_glob
 export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$PATH"
 
 SELF=${0:A}
-PINNED=${HERDR_PROJECTS_FILE:-$HOME/.config/herdr/projects}
-HISTORY=${XDG_STATE_HOME:-$HOME/.local/state}/herdr/new-workspace-history
+HERDR=${HERDR_BIN_PATH:-herdr}
+PLUGIN_ID=bethanyj28.new-workspace
+PINNED=${HERDR_PROJECTS_FILE:-${HERDR_PLUGIN_CONFIG_DIR:-$HOME/.config/herdr}/projects}
+STATE_DIR=${HERDR_PLUGIN_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/herdr}
+HISTORY=$STATE_DIR/new-workspace-history
 HISTORY_MAX=50
-AGENT_STATE=${HISTORY:h}/new-workspace-agent
+AGENT_STATE=$STATE_DIR/new-workspace-agent
 AGENTS=(claude copilot codex gemini opencode amp cursor-agent)
 TAB=$'\t'
 
@@ -59,7 +57,7 @@ build_candidates() {
         [[ -n $line ]] && print -r -- "★$TAB$(expand_path "$line")"
       done < "$PINNED"
     fi
-    herdr pane list 2>/dev/null | jq -r '.result.panes[]?.cwd // empty' 2>/dev/null |
+    "$HERDR" pane list 2>/dev/null | jq -r '.result.panes[]?.cwd // empty' 2>/dev/null |
       while IFS= read -r p; do print -r -- "●$TAB$p"; done
     if [[ -r $HISTORY ]]; then
       while IFS= read -r p; do print -r -- "◷$TAB$p"; done < "$HISTORY"
@@ -187,8 +185,24 @@ ask() {  # ask <var> <prompt>  — editable prefilled input
   vared -p "%B$2%b " "$1"
 }
 
+# Plugin action: open the popup pane, starting from the focused pane's directory.
+open_popup() {
+  local start=$(print -r -- "${HERDR_PLUGIN_CONTEXT_JSON-}" | jq -r '.focused_pane_cwd // empty' 2>/dev/null)
+  exec "$HERDR" plugin pane open --plugin $PLUGIN_ID --entrypoint picker --focus \
+    ${start:+--env} ${start:+HNW_START_DIR=$start}
+}
+
 main() {
-  export HNW_CACHE=$(mktemp -t herdr-new-workspace)
+  local missing=() c
+  for c in fzf jq git; do (( $+commands[$c] )) || missing+=$c; done
+  if (( $#missing )); then
+    print -r -- "herdr-new-workspace needs: ${missing[*]}"
+    read -sk1 '?press any key to close'
+    exit 1
+  fi
+  [[ -d ${HNW_START_DIR-} ]] && cd "$HNW_START_DIR"
+
+  export HNW_CACHE=$(mktemp "${TMPDIR:-/tmp}/herdr-new-workspace.XXXXXX")
   trap 'rm -f "$HNW_CACHE"' EXIT
   trap 'exit 130' INT
   build_candidates > "$HNW_CACHE"
@@ -209,11 +223,11 @@ main() {
   [[ -n $label ]] && cmd+=(--label "$label")
 
   local out
-  if out=$(herdr "${cmd[@]}" 2>&1); then
+  if out=$("$HERDR" "${cmd[@]}" 2>&1); then
     record_history "$dir"
     if [[ -n $agent ]]; then
       local pane=$(print -r -- "$out" | jq -r '.result.root_pane.pane_id // empty')
-      [[ -n $pane ]] && herdr pane run "$pane" "$agent" >/dev/null
+      [[ -n $pane ]] && "$HERDR" pane run "$pane" "$agent" >/dev/null
     fi
   else
     print -r -- "herdr workspace create failed:"
@@ -230,5 +244,6 @@ case ${1-} in
   --preview) preview "${2-}" ;;
   --toggle-pin) toggle_pin "${2-}" ;;
   --ensure-pinned) ensure_pinned_file ;;
+  --open) open_popup ;;
   *) main ;;
 esac
