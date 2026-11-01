@@ -22,7 +22,8 @@ STATE_DIR=${HERDR_PLUGIN_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/herdr}
 HISTORY=$STATE_DIR/new-workspace-history
 HISTORY_MAX=50
 AGENT_STATE=$STATE_DIR/new-workspace-agent
-AGENTS=(claude copilot codex gemini opencode amp cursor-agent)
+AGENTS=(claude copilot codex gemini agy opencode amp cursor-agent pi omp devin cline mastracode
+        kimi kiro-cli droid grok hermes kilo qodercli qwen letta maki muse)
 TAB=$'\t'
 
 # ── helpers ──────────────────────────────────────────────────────────────────
